@@ -112,7 +112,7 @@ Scaling and Healing: Pods do not provide auto-scaling and auto-healing by defaul
 Crash Recovery: Pod crashes are handled by higher-level objects which ensure that failed pods are automatically replaced or restarted.
 
 
-**Containe Engine**
+**Container Engine**
 
 Kubelet Interaction: Works in conjunction with the Kubelet to manage container operations.
 
