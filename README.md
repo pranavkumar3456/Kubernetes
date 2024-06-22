@@ -10,6 +10,7 @@ Components of Master Plane
 4. Controller Manager
 
 **API Server**
+
 User Interaction: Acts as the primary point of interaction for administrators and users, exposing the Kubernetes API.
 Scalability: Designed to scale horizontally to handle varying loads and request volumes efficiently.
 Control Plane Front End: Serves as the front end of the Kubernetes control plane, handling REST operations and coordinating cluster activities.
