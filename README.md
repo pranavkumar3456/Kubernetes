@@ -124,7 +124,10 @@ Port Exposure: Exposes ports specified in the manifest, allowing external access
 
 
 
+
+
 **Kubernetes Objects**
+
 
 
 
