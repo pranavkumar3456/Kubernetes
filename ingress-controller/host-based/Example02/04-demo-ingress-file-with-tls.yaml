@@ -1,0 +1,31 @@
+#Make sure, you create a secret and upload your tls certificate from the domain
+#kubectl create secret tls demo-tls --cert=tls.crt --key=tls.key --namespace default ( Also keep the name of file with tls only as it gives error if your change the name tls. )
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-localhost
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    #service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - demoinfra.info
+    secretName: demo-tls
+  rules:
+  - host: demoinfra.info
+    http:
+      paths:
+      - backend:
+          service:
+            name: demo
+            port:
+              number: 80
+        path: /
+        pathType: Prefix
+status:
+  loadBalancer: {}
