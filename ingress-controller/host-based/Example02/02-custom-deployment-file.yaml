@@ -1,0 +1,27 @@
+# create a secret before running ths deployment.yaml
+# kubectl create secret docker-registry acr-secret --docker-server=<acr-name>.azurecr.io --docker-username=<acr-username> --docker-password=<acr-secret> --docker-email=<yourdockeremailid>
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+  namespace: default
+  labels:
+    app: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+      - name: httpd
+        image: acrqaci001.azurecr.io/nginx-ingress-deployment-uat:latest
+        ports:
+        - containerPort: 80
+      imagePullSecrets:
+      - name: acr-secret
