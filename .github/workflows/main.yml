@@ -1,0 +1,361 @@
+name: "Platform CD"
+
+on:
+  schedule:
+    # from Monday to Friday at 6:00 AM
+    - cron: "0 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+       actions:
+         description: "Action Options"
+         default: "all"
+         type: choice
+         options:
+           - terraform
+           - docker-image
+           - kustomize
+           - all
+      option:
+        description: "Terraform option"
+        default: "apply"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: "Environment to deploy applications to"
+        default: "qa"
+        type: choice
+        options:
+          - dev
+          - qa
+
+permissions: 
+  id-token: write
+  contents: read
+
+env:
+  CLUSTER_NAME: "aks-lgtm-${{ github.event.inputs.environment }}"
+  RESOURCE_GROUP: "${{ vars.RESOURCE_GROUP }}"
+
+jobs:
+  terraform-execute:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    env:
+      ARM_TENANT_ID : ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID : ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_CLIENT_ID : ${{vars.AZURE_MI_CLIENT_ID}}
+      TF_VERSION: 1.7.4
+      RESOURCE_GROUP: ${{ vars.TF_RESOURCE_GROUP }}
+      STORAGE_ACCOUNT: ${{ vars.TF_STORAGE_ACCOUNT }}
+      STORAGE_SECRET: ${{ secrets.TF_STORAGE_SECRET }}
+      CONTAINER_NAME: ${{vars.TF_CONTAINER_NAME}}
+      STATE_KEY: ${{vars.TF_STATE_KEY}}
+      GIT_TOKEN: ${{ secrets.GH_TOKEN }}
+      GITRUNNER_TOKEN: ${{secrets.RUNNER_REGISTRATION_TOKEN}}
+    outputs:
+      ACR_REPO: ${{ steps.tf-output.outputs.ACR_REPO }}
+      ACR_USER: ${{ steps.tf-output.outputs.ACR_USER }}
+      ACR_PASS: ${{ steps.tf-output.outputs.ACR_PASSWORD }}
+      POSTGRES_PASSWORD: ${{ steps.tf-output.outputs.POSTGRES_PASSWORD }}
+      public_ip_address: ${{ steps.tf-output.outputs.public_ip_address }}
+      POSTGRES_FQDN: ${{ steps.tf-output.outputs.POSTGRES_FQDN }}
+      COSMOSDB_ACCESSKEY: ${{ steps.tf-output.outputs.COSMOSDB_ACCESSKEY }}
+      COSMOSDB_URI: ${{ steps.tf-output.outputs.COSMOSDB_URI }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+    environment: "${{ github.event.inputs.environment }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      
+      - name: 'Authenticate to Azure'
+        uses: azure/login@v1
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+  
+      - name: Terraform init
+        id: init
+        run: terraform init -backend-config="resource_group_name=${{ env.RESOURCE_GROUP }}" -backend-config="storage_account_name=${{ env.STORAGE_ACCOUNT }}" -backend-config="container_name=${{env.CONTAINER_NAME}}" -backend-config="key=${{env.STATE_KEY}}" -backend-config="access_key=${{env.STORAGE_SECRET}}"
+
+      - name: Terraform plan
+        id: tf-plan
+        if: "${{ github.event.inputs.option == 'plan' }}"
+        run: terraform ${{ github.event.inputs.option }} --var-file=${{ github.event.inputs.environment }}.tfvars -var="runner_token=${{env.GITRUNNER_TOKEN}}" -no-color -input=false
+  
+      - name: Terraform ${{ github.event.inputs.option }}
+        id: tf-execute
+        if: "${{ github.event.inputs.option == 'apply' || github.event.inputs.option == 'destroy' }}"
+        run: terraform ${{ github.event.inputs.option }} --var-file=${{ github.event.inputs.environment }}.tfvars -var="runner_token=${{env.GITRUNNER_TOKEN}}" -auto-approve -input=false
+
+      - name: Terraform output
+        id: tf-output
+        if: "${{ github.event.inputs.option == 'apply' }}"
+        run: |
+          repo=$(terraform output -raw acr_login_server)
+          user=$(terraform output -raw acr_admin_username)
+          # pass=$(terraform output -raw acr_admin_password)
+          public_ip=$(terraform output -raw public_ip_address)
+          postgres_password=$(terraform output -raw db_password)
+          cosmosdb_accesskey=$(terraform output -raw cosmosdb_accesskey)
+          cosmosdb_uri=$(terraform output -raw cosmosdb_uri)
+          POSTGRES_FQDN_tf=$(terraform output -raw postgres_fqdn)
+
+          echo "ACR_REPO=$repo" >> "$GITHUB_OUTPUT"
+          echo "ACR_USER=$user" >> "$GITHUB_OUTPUT"
+          # echo "ACR_PASSWORD=$pass" >> "$GITHUB_OUTPUT"
+          echo "POSTGRES_PASSWORD=$postgres_password" >> "$GITHUB_OUTPUT"
+          echo "COSMOSDB_ACCESSKEY=$(echo -n $cosmosdb_accesskey | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          echo "COSMOSDB_URI=$cosmosdb_uri" >> "$GITHUB_OUTPUT"
+          echo "POSTGRES_FQDN=$POSTGRES_FQDN_tf" >> "$GITHUB_OUTPUT"
+          echo "public_ip_address=$public_ip" >> "$GITHUB_OUTPUT"
+          echo $GITHUB_OUTPUT
+
+  publish-images:
+    name: "Publish Docker Images"
+    runs-on: ubuntu-latest
+    needs: terraform-execute
+    if: "${{ github.event.inputs.option == 'apply' }}"
+    environment: "${{ github.event.inputs.environment }}"
+    steps:
+      - uses: actions/checkout@v4
+      - id: publish-docker-images
+        uses: ./.github/actions/publish-docker-images
+        with:
+          client-id: ${{vars.AZURE_MI_CLIENT_ID}}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+
+  setup-env:
+    name: "Setup Environment"
+    runs-on: ubuntu-latest
+    needs: terraform-execute
+    if: "${{ github.event.inputs.option == 'apply' }}"
+    environment: "${{ github.event.inputs.environment }}"
+    outputs:
+      kubelet_identity: ${{ steps.get-kubelet-identity.outputs.kubelet_identity }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: aks-connect
+        uses: ./.github/actions/aks-connect
+        with:
+          client-id: ${{ vars.AZURE_MI_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Install CRDs
+        env:
+          GRAFANA_REPO: "https://raw.githubusercontent.com/grafana/agent/main/operations/agent-static-operator/crds"
+          PROMETHEUS_REPO: "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example"
+        run: |
+          CRDS=(
+            "${{ env.GRAFANA_REPO }}/monitoring.grafana.com_metricsinstances.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.grafana.com_grafanaagents.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.coreos.com_servicemonitors.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.coreos.com_podmonitors.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.coreos.com_probes.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.grafana.com_podlogs.yaml"
+            "${{ env.GRAFANA_REPO }}/monitoring.grafana.com_logsinstances.yaml"
+            "${{ env.PROMETHEUS_REPO }}/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml"
+          )
+
+          for crd in "${CRDS[@]}"; do
+            kubectl apply -f "$crd"
+          done
+
+      - name: Retrieve Kubelet identity
+        id: get-kubelet-identityb
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            identity=$(az aks show --resource-group ${{ vars.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --query identityProfile.kubeletidentity.clientId -o tsv)
+            echo "kubelet_identity=$identity" >> "$GITHUB_OUTPUT"
+
+      - name: Setup helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.9.0'
+
+  create-app-secrets:
+    name: "Create App secrets"
+    runs-on: ubuntu-latest
+    environment: "${{ github.event.inputs.environment }}"
+    needs: [setup-env, terraform-execute]
+    steps:
+      - uses: actions/checkout@v4
+      - id: aks-connect
+        uses: ./.github/actions/aks-connect
+        with:
+          client-id: ${{ vars.AZURE_MI_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Create .htpasswd file
+        run: echo "${{ secrets.HTPASSWD }}" | base64 --decode > $GITHUB_WORKSPACE/.htpasswd
+
+      - name: Create Mimir, Loki, Tempo secrets
+        working-directory: ./src
+        run: |
+          for namespace in mimir loki tempo ; do
+            kubectl get namespace $namespace || kubectl create namespace $namespace
+            kubectl get secret htpasswd -n $namespace || kubectl create secret generic htpasswd --from-file=$GITHUB_WORKSPACE/.htpasswd -n $namespace
+          done
+
+      - id: otelc-secret
+        name: Create OTELC secrets
+        env:
+          KUBE_NAMESPACE: otelc
+          COSMOSDB_ACCESSKEY: ${{ needs.terraform-execute.outputs.COSMOSDB_ACCESSKEY }}
+          COSMOSDB_URI: ${{ needs.terraform-execute.outputs.COSMOSDB_URI }}
+          emailConnectionString: ${{ secrets.EMAIL_CONNECTION_STRING }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: | 
+          kubectl get namespace ${{ env.KUBE_NAMESPACE }} || kubectl create namespace ${{ env.KUBE_NAMESPACE }}
+          cosmoAccessKey=$(echo -n ${{ env.COSMOSDB_ACCESSKEY }} | base64 --decode)
+          kubectl get secret servicemanager-secret -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic \
+              servicemanager-secret -n ${{ env.KUBE_NAMESPACE }} \
+              --from-literal=uri=${{ env.COSMOSDB_URI }} \
+              --from-literal=accesskey=$cosmoAccessKey \
+              --from-literal=grafanaAdminPassword='${{ env.GRAFANA_ADMIN_PASSWORD }}' \
+              --from-literal=database=consumer \
+              --from-literal=emailConnectionString='${{ env.emailConnectionString }}';
+          kubectl get secret sec-azuread-auth -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic sec-azuread-auth --from-literal=CLIENT_ID="${{ vars.GRAFANA_AZURE_CLIENT_ID }}" --from-literal=CLIENT_SECRET="${{ secrets.GRAFANA_AZURE_CLIENT_SECRET }}" -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get secret internal-auth-token -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic internal-auth-token -n ${{ env.KUBE_NAMESPACE }} \
+          --from-literal=internal-user="${{ secrets.OTELC_INTERNAL_USER }}" \
+          --from-literal=self-monitoring="${{ secrets.OTELC_MONITORING_USER }}"
+
+  create-grafana-secrets:
+    name: "Create Grafana secrets"
+    runs-on: ubuntu-latest
+    environment: "${{ github.event.inputs.environment }}"
+    needs: [setup-env, terraform-execute]
+    env:
+      KUBE_NAMESPACE: grafana
+      POSTGRES_PASSWORD: ${{ needs.terraform-execute.outputs.POSTGRES_PASSWORD }}
+      POSTGRES_FQDN: ${{ needs.terraform-execute.outputs.POSTGRES_FQDN }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: aks-connect
+        uses: ./.github/actions/aks-connect
+        with:
+          client-id: ${{ vars.AZURE_MI_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Install Grafana secrets
+        run: |
+          kubectl get namespace ${{ env.KUBE_NAMESPACE }} || kubectl create namespace ${{ env.KUBE_NAMESPACE }}
+          kubectl get secret sec-login-credentials -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic sec-login-credentials --from-literal=admin-user=admin --from-literal=admin-password='${{ env.GRAFANA_ADMIN_PASSWORD }}' -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get secret sec-postgresq-password -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic sec-postgresq-password --from-literal=POSTGRES_PASSWORD='${{ env.POSTGRES_PASSWORD }}' --from-literal=POSTGRES_FQDN='${{ env.POSTGRES_FQDN }}:5432' -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get secret sec-azuread-auth -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic sec-azuread-auth --from-literal=CLIENT_ID="${{ vars.GRAFANA_AZURE_CLIENT_ID }}" --from-literal=CLIENT_SECRET="${{ secrets.GRAFANA_AZURE_CLIENT_SECRET }}" -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get secret sec-smtp-cred -n ${{ env.KUBE_NAMESPACE }} || kubectl create secret generic sec-smtp-cred --from-literal=user="${{ secrets.GRAFANA_SMTP_USER }}" --from-literal=password="${{ secrets.GRAFANA_SMTP_PASS }}" -n ${{ env.KUBE_NAMESPACE }}
+
+  deploy-argocd:
+    name: "Deploy ArgoCD"
+    runs-on: ubuntu-latest
+    environment: "${{ github.event.inputs.environment }}"
+    needs: setup-env
+    env:
+      HELM_REPO: https://argoproj.github.io/argo-helm
+      KUBE_NAMESPACE: argocd
+      VERSION: 7.3.11
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: aks-connect
+        uses: ./.github/actions/aks-connect
+        with:
+          client-id: ${{ vars.AZURE_MI_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+  
+      - name: Install ArgoCD
+        working-directory: ./apps/argocd
+        run: |
+          kubectl get namespace ${{ env.KUBE_NAMESPACE }} || kubectl create namespace ${{ env.KUBE_NAMESPACE }}
+          helm repo add argo ${{ env.HELM_REPO }}
+          helm upgrade --install argocd argo/argo-cd -f base/values.yaml -f overlays/"${{ github.event.inputs.environment }}"/values.yaml --set configs.repositories.monitoring-services-lgtm.password="${{ secrets.REPO_TOKEN }}" -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/cc9dd34216d98be8efe341939094867b553b2cbc/hack/install_kustomize.sh" | bash
+
+      - name: Install ArgoCD Applications
+        working-directory: ./apps
+        env:
+          AZURE_TENANT_ID : ${{ vars.AZURE_TENANT_ID }}
+          AZURE_ARGO_CLIENT_ID : <redacted>
+          AZURE_ARGO_CLIENT_SECRET: <redacted>
+          ARGOCD_GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
+          ARGO_CD_SSO_CERTIFICATE: ${{ secrets.ARGO_CD_SSO_CERTIFICATE }}
+        run: |
+          kustomize build "argocd/base" | envsubst | kubectl apply -f -
+
+  deploy-kustomize:
+    name: "Deploy Kustomize"
+    runs-on: ubuntu-latest
+    environment: "${{ github.event.inputs.environment }}"
+    needs: [setup-env, deploy-argocd, create-app-secrets, create-grafana-secrets, terraform-execute]
+    env:
+      KUSTOMIZE_VERSION: 4.5.7
+      MIMIR_AZURE_USER_ID: ${{ needs.setup-env.outputs.kubelet_identity }}
+      LOKI_AZURE_USER_ID:  ${{ needs.setup-env.outputs.kubelet_identity }}
+      TEMPO_AZURE_USER_ID: ${{ needs.setup-env.outputs.kubelet_identity }}
+      ENTRYPOINT_CERT: ${{ secrets.ENTRYPOINT_CERT }}
+      ENTRYPOINT_PRIVATE_KEY: ${{ secrets.ENTRYPOINT_PRIVATE_KEY }}
+      INTERNAL_AUTH_TOKEN: ${{ secrets.OTELC_INTERNAL_USER }}
+      SELF_MONITORING_AUTH_TOKEN: ${{ secrets.OTELC_MONITORING_USER }}
+      COSMOS_DB_KEY: ${{ secrets.COSMOS_DB_KEY }}
+      PUBLIC_IP_ADDRESS: ${{ needs.terraform-execute.outputs.public_ip_address }}
+
+    steps:
+      - uses: actions/checkout@v4
+  
+      - id: aks-connect
+        uses: ./.github/actions/aks-connect
+        with:
+          client-id: ${{ vars.AZURE_MI_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+        
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/cc9dd34216d98be8efe341939094867b553b2cbc/hack/install_kustomize.sh" | bash
+
+      - name: Apply Kustomize manifests
+        working-directory: ./apps
+        run: |
+          kustomize build "grafana/overlays/${{ github.event.inputs.environment }}" | kubectl apply -f -
+          kustomize build "loki/overlays/${{ github.event.inputs.environment }}" | envsubst '$LOKI_AZURE_USER_ID' | kubectl apply -f -
+          kustomize build "mimir/overlays/${{ github.event.inputs.environment }}" | envsubst '$MIMIR_AZURE_USER_ID' | kubectl apply -f -
+          kustomize build "tempo/overlays/${{ github.event.inputs.environment }}" | envsubst '$TEMPO_AZURE_USER_ID' | kubectl apply -f -
+          kustomize build "otelc/overlays/${{ github.event.inputs.environment }}" | envsubst '$INTERNAL_AUTH_TOKEN SELF_MONITORING_AUTH_TOKEN' | kubectl apply -f -
+          kustomize build "entrypoint/overlays/${{ github.event.inputs.environment }}" | envsubst '$ENTRYPOINT_CERT $ENTRYPOINT_PRIVATE_KEY $COSMOS_DB_KEY $PUBLIC_IP_ADDRESS' | kubectl apply -f -
